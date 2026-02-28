@@ -1,0 +1,997 @@
+#compdef ttdl
+# ------------------------------------------------------------------------------
+# Description
+# -----------
+#
+#  Completion script for TTDL (Terminal ToDo List) - a todo.txt manager
+#  https://github.com/VladimirMarkelov/ttdl
+#
+# ------------------------------------------------------------------------------
+# Authors
+# -------
+#
+#  * 83noit (initial version; WIP)
+#
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Dynamic completion helpers
+# ------------------------------------------------------------------------------
+
+# Generic helper for completing ttdl list output with optional prefix
+(( $+functions[_ttdl_complete_list] )) ||
+_ttdl_complete_list() {
+  local cmd="$1" prefix="${2:-}"
+  local -a items
+  items=(${(f)"$(_call_program ${cmd} ttdl ${cmd} 2>/dev/null)"})
+  [[ -z "$items" ]] && return 1
+  [[ -n "$prefix" ]] && items=(${items/#/$prefix})
+  # -Q: don't quote special characters (needed for # in hashtags)
+  # -S ' ': add space after completion
+  compadd -Q -S ' ' -a items
+}
+
+(( $+functions[_ttdl_projects] )) ||
+_ttdl_projects() { _ttdl_complete_list listprojects }
+
+(( $+functions[_ttdl_contexts] )) ||
+_ttdl_contexts() { _ttdl_complete_list listcontexts }
+
+(( $+functions[_ttdl_hashtags] )) ||
+_ttdl_hashtags() { _ttdl_complete_list listhashtags }
+
+# ------------------------------------------------------------------------------
+# Todo ID and search completion
+# ------------------------------------------------------------------------------
+
+(( $+functions[_ttdl_get_todos] )) ||
+_ttdl_get_todos() {
+  local max_items="${1:-500}"
+  # Use --fields for clean output: just ID and subject
+  # Use --all to include completed todos, --sort=+id to ensure numeric order
+  reply=(${(f)"$(_call_program todos ttdl list -a --fields=id,subject --sort=+id 2>/dev/null | head -n $max_items)"})
+}
+
+(( $+functions[_ttdl_todo_ids] )) ||
+_ttdl_todo_ids() {
+  local current="$words[CURRENT]"
+
+  # Don't complete IDs when typing options (starting with -)
+  [[ "$current" == -* ]] && return
+
+  local -a raw_todos
+
+  # Get all todos (uses default limit of 500)
+  _ttdl_get_todos
+  raw_todos=("${reply[@]}")
+
+  if [[ -z "${raw_todos[*]}" ]]; then
+    _message 'todo ID (1, 2, 3, ... or range like 1-5)'
+    return
+  fi
+
+  # Parse todos into parallel arrays for easier manipulation
+  local -a all_ids all_subjects
+  local line id rest
+  for line in "${raw_todos[@]}"; do
+    id="${line%%[[:space:]]*}"
+    rest="${line#*[[:space:]]}"
+    if [[ -n "$id" ]]; then
+      all_ids+=("$id")
+      all_subjects+=("$rest")
+    fi
+  done
+
+  # Numerically sort IDs (zsh's (n) flag for numeric sorting)
+  local -a sorted_indices
+  sorted_indices=(${(on)all_ids})
+
+  # Handle range completion (e.g., "3-" should complete to "3-5", "3-10", etc.)
+  if [[ "$current" =~ ^([0-9]+)-$ ]]; then
+    local range_start="${match[1]}"
+    local -a range_ids range_displays
+    local i idx
+    for idx in "${sorted_indices[@]}"; do
+      for ((i=1; i<=${#all_ids[@]}; i++)); do
+        if [[ "${all_ids[$i]}" == "$idx" ]]; then
+          if (( idx > range_start )); then
+            range_ids+=("${range_start}-${idx}")
+            range_displays+=("${range_start}-${idx} (${all_subjects[$i]})")
+          fi
+          break
+        fi
+      done
+    done
+    # -M '': disable all matching (exact only), -U: don't filter
+    compadd -M '' -U -d range_displays -o nosort -a range_ids
+    return
+  fi
+
+  # Use fzf if available and enabled via zstyle (default: true)
+  # To disable: zstyle ':completion:*:*:ttdl:*' use-fzf false
+  local use_fzf
+  zstyle -b ":completion:${curcontext}:" use-fzf use_fzf || use_fzf=yes
+  if [[ "$use_fzf" == yes ]] && command -v fzf &>/dev/null && [[ -t 0 ]]; then
+    local selected
+    selected=$(printf '%s\n' "${raw_todos[@]}" | fzf --height=10 --reverse --prompt="Select todo: " 2>/dev/null)
+    if [[ -n "$selected" ]]; then
+      local fzf_id="${selected%%[[:space:]]*}"
+      compadd -M '' -U -- "$fzf_id"
+      return
+    fi
+  fi
+
+  # Build sorted display list with strict ID prefix matching
+  local -a ids displays
+  local i idx matched=0
+
+  for idx in "${sorted_indices[@]}"; do
+    # Strict prefix matching: if user typed digits, only show IDs starting with those digits
+    if [[ -n "$current" && "$current" =~ ^[0-9]+$ ]]; then
+      # Only match IDs that START with the typed prefix (exact prefix match)
+      [[ "$idx" != "$current"* ]] && continue
+    fi
+
+    # Find subject for this ID
+    for ((i=1; i<=${#all_ids[@]}; i++)); do
+      if [[ "${all_ids[$i]}" == "$idx" ]]; then
+        ids+=("$idx")
+        displays+=("$idx ${all_subjects[$i]}")
+        matched=1
+        break
+      fi
+    done
+  done
+
+  # If we have matches, show them
+  if (( matched )); then
+    # Use -V (unsorted group) to prevent fzf-tab interference
+    local expl
+    _description -V todo-ids expl 'todo ID'
+    # -M '': disable matcher-list, -U: don't filter, -d: descriptions, -o nosort: preserve order
+    compadd -M '' -U -d displays -o nosort "${expl[@]}" -a ids
+  else
+    _message "no todo ID starts with '$current'"
+  fi
+}
+
+# Helper to extract subject words (excluding metadata like @context, +project, etc.)
+(( $+functions[_ttdl_subject_words] )) ||
+_ttdl_subject_words() {
+  local -a raw_todos words_list
+  local max_items=50
+
+  _ttdl_get_todos $max_items
+  raw_todos=("${reply[@]}")
+
+  local line subject word
+  for line in "${raw_todos[@]}"; do
+    # Remove the ID prefix
+    subject="${line#*[[:space:]]}"
+    # Split into words and filter out metadata
+    for word in ${(z)subject}; do
+      # Skip metadata: @context, +project, #hashtag, key:value, priority (A)
+      [[ "$word" == @* ]] && continue
+      [[ "$word" == +* ]] && continue
+      [[ "$word" == \#* ]] && continue
+      [[ "$word" == *:* ]] && continue
+      [[ "$word" == '('?')' ]] && continue
+      # Skip very short words
+      (( ${#word} < 2 )) && continue
+      words_list+=("$word")
+    done
+  done
+
+  # Deduplicate
+  words_list=(${(u)words_list})
+  reply=("${words_list[@]}")
+}
+
+# Search completion for list command - context-aware
+# Empty: show full task subjects
+# Digits: switch strictly to ID completion
+# Text: switch to subject word completion
+(( $+functions[_ttdl_search] )) ||
+_ttdl_search() {
+  local current="$words[CURRENT]"
+
+  # Don't complete when typing options (starting with -)
+  [[ "$current" == -* ]] && return
+
+  # Complete projects/contexts/hashtags when prefix is typed
+  case "$current" in
+    +*)
+      local -a items
+      items=(${(f)"$(_call_program listprojects ttdl listprojects 2>/dev/null)"})
+      [[ -n "$items" ]] && compadd -S ' ' -p '+' -a items
+      return
+      ;;
+    @*)
+      local -a items
+      items=(${(f)"$(_call_program listcontexts ttdl listcontexts 2>/dev/null)"})
+      [[ -n "$items" ]] && compadd -S ' ' -p '@' -a items
+      return
+      ;;
+    \#*)
+      local -a items
+      items=(${(f)"$(_call_program listhashtags ttdl listhashtags 2>/dev/null)"})
+      [[ -n "$items" ]] && compadd -Q -S ' ' -p '#' -a items
+      return
+      ;;
+  esac
+
+  # Context-aware completion based on input type
+  if [[ -z "$current" ]]; then
+    # Empty: show full task subjects with IDs
+    _ttdl_todo_ids
+  elif [[ "$current" =~ ^[0-9]+$ ]]; then
+    # Digits only: strict ID completion (prefix matching handled in _ttdl_todo_ids)
+    _ttdl_todo_ids
+  elif [[ "$current" =~ ^[0-9]+-$ ]]; then
+    # Range in progress: complete with ID range
+    _ttdl_todo_ids
+  else
+    # Text: complete with subject words (excluding metadata)
+    local -a subject_words
+    _ttdl_subject_words
+    subject_words=("${reply[@]}")
+
+    if [[ -n "$subject_words" ]]; then
+      compadd -S ' ' -a subject_words
+    fi
+
+    # Also offer project/context/hashtag prefixes
+    _message 'or use @context, +project, #hashtag'
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Value completion helpers
+# ------------------------------------------------------------------------------
+
+# Time unit descriptions
+(( $+functions[_ttdl_time_units] )) ||
+_ttdl_time_units() {
+  local prefix="$1"
+  local suffix="${2:- }"
+  local -a units=(
+    'd:days'
+    'w:weeks'
+    'm:months'
+    'y:years'
+    'b:business days'
+  )
+  _describe -t units 'unit' units -P "$prefix" -S "$suffix"
+}
+
+# Date completion with range support
+(( $+functions[_ttdl_dates] )) ||
+_ttdl_dates() {
+  local current="$words[CURRENT]"
+  local prefix=""
+  local suffix=""
+
+  # Check if we're completing a range (after ..)
+  if [[ "$current" == *..* ]]; then
+    prefix="${current%..*}.."
+    current="${current##*..}"
+    suffix=" "  # Add space after second element of range
+  elif [[ "$current" == *. ]]; then
+    # User typed one dot, might be starting a range
+    prefix="${current%.}"
+    compadd -S '' -P "$prefix" -- '.'
+    return
+  fi
+
+  local -a keywords=(
+    'today:current day'
+    'tomorrow:next day'
+    'tm:tomorrow (short)'
+    'tmr:tomorrow (short)'
+    'yesterday:previous day'
+    'none:no date set'
+    'overdue:past due dates'
+    'soon:due in the next few days'
+  )
+
+  local -a weekdays=(
+    'monday:next Monday' 'mon:next Monday'
+    'tuesday:next Tuesday' 'tu:next Tuesday' 'tue:next Tuesday'
+    'wednesday:next Wednesday' 'wed:next Wednesday'
+    'thursday:next Thursday' 'th:next Thursday' 'thu:next Thursday'
+    'friday:next Friday' 'fri:next Friday'
+    'saturday:next Saturday' 'sat:next Saturday'
+    'sunday:next Sunday' 'sun:next Sunday'
+  )
+
+  local -a months=(
+    'january:1st of January' 'jan:1st of January'
+    'february:1st of February' 'feb:1st of February'
+    'march:1st of March' 'mar:1st of March'
+    'april:1st of April' 'apr:1st of April'
+    'may:1st of May'
+    'june:1st of June' 'jun:1st of June'
+    'july:1st of July' 'jul:1st of July'
+    'august:1st of August' 'aug:1st of August'
+    'september:1st of September' 'sep:1st of September'
+    'october:1st of October' 'oct:1st of October'
+    'november:1st of November' 'nov:1st of November'
+    'december:1st of December' 'dec:1st of December'
+  )
+
+  local -a relative=(
+    '1d:in 1 day'
+    '2d:in 2 days'
+    '1w:in 1 week'
+    '2w:in 2 weeks'
+    '1m:in 1 month'
+    '1y:in 1 year'
+  )
+
+  # Check if user is typing a relative date (number + unit)
+  if [[ "$current" =~ ^[0-9]+$ ]]; then
+    _ttdl_time_units "$prefix$current" "$suffix"
+    return
+  fi
+
+  # Show all options
+  _describe -t keywords 'date keyword' keywords -P "$prefix" -S "$suffix"
+  _describe -t weekdays 'weekday' weekdays -P "$prefix" -S "$suffix"
+  _describe -t months 'month' months -P "$prefix" -S "$suffix"
+  _describe -t relative 'relative date' relative -P "$prefix" -S "$suffix"
+
+  # Hint for date format
+  _message 'or YYYY-MM-DD, or range like today..tomorrow'
+}
+
+# Priority filter for --pri (filtering)
+(( $+functions[_ttdl_priorities] )) ||
+_ttdl_priorities() {
+  local -a priorities=(
+    'any:any priority'
+    'none:no priority set'
+    '+:prefix for priority or higher'
+    '-:prefix for priority or lower'
+  )
+  _describe -t priorities 'priority' priorities
+  _message 'or A-Z, +A for A or higher, -C for C or lower'
+}
+
+# Priority value for --set-pri (setting)
+(( $+functions[_ttdl_set_priority] )) ||
+_ttdl_set_priority() {
+  local -a priorities=(
+    'none:remove priority'
+  )
+  _describe -t priorities 'priority' priorities
+  _message 'or A-Z to set priority'
+}
+
+# Recurrence filter for --rec (filtering only, not setting values)
+(( $+functions[_ttdl_rec_filter] )) ||
+_ttdl_rec_filter() {
+  local -a filters=(
+    'any:tasks with any recurrence'
+    'none:tasks without recurrence'
+    '+:tasks with recurrence'
+    '-:tasks without recurrence'
+  )
+  _describe -t recurrence-filter 'recurrence filter' filters
+}
+
+# Recurrence values for --set-rec (actual recurrence patterns)
+(( $+functions[_ttdl_recurrence] )) ||
+_ttdl_recurrence() {
+  local current="$words[CURRENT]"
+
+  # Check if user is typing a number for custom recurrence
+  if [[ "$current" =~ ^[+]?[0-9]+$ ]]; then
+    _ttdl_time_units "$current" " "
+    return
+  fi
+
+  local -a recurrence=(
+    'none:remove recurrence'
+    '1d:daily'
+    '1b:every business day'
+    '1w:weekly'
+    '2w:biweekly'
+    '1m:monthly'
+    '1y:yearly'
+    '+1d:strict daily (relative to due)'
+    '+1w:strict weekly (relative to due)'
+    '+1m:strict monthly (relative to due)'
+  )
+  _describe -t recurrence 'recurrence' recurrence
+}
+
+# Tag filter for --tag (format: name:value)
+(( $+functions[_ttdl_tag_filter] )) ||
+_ttdl_tag_filter() {
+  _message 'tag filter (name:value, e.g. status:pending)'
+}
+
+# Complex filter expression for --filter
+(( $+functions[_ttdl_filter_expr] )) ||
+_ttdl_filter_expr() {
+  _message 'filter expression (e.g. "+project and @context", "due:today or pri:A")'
+}
+
+# Tag value for --set-tag (format: name=value)
+(( $+functions[_ttdl_tag_value] )) ||
+_ttdl_tag_value() {
+  _message 'tag (name=value, e.g. status=done)'
+}
+
+# Comma-separated list of fields for --fields option
+(( $+functions[_ttdl_fields_list] )) ||
+_ttdl_fields_list() {
+  _values -s , 'field' \
+    'id[task ID]' \
+    'done[completion status]' \
+    'pri[priority]' \
+    'created[creation date]' \
+    'finished[completion date]' \
+    'due[due date]' \
+    'thr[threshold date]' \
+    'spent[time spent]' \
+    'uid[unique ID]' \
+    'parent[parent task]' \
+    'prj[project]' \
+    'ctx[context]' \
+    'subject[task subject]'
+}
+
+(( $+functions[_ttdl_sort_fields] )) ||
+_ttdl_sort_fields() {
+  local current="$words[CURRENT]"
+
+  # Handle +/- prefix for sort direction
+  local prefix=""
+  if [[ "$current" == +* ]]; then
+    prefix="+"
+  elif [[ "$current" == -* ]]; then
+    prefix="-"
+  fi
+
+  local -a fields=(
+    'id:task ID'
+    'done:completion status'
+    'pri:priority'
+    'created:creation date'
+    'finished:completion date'
+    'due:due date'
+    'thr:threshold date'
+    'spent:time spent'
+    'subject:task subject'
+    'project:project name'
+    'context:context name'
+  )
+
+  if [[ -n "$prefix" ]]; then
+    _describe -t sort-fields 'sort field' fields -P "$prefix"
+  else
+    _describe -t sort-fields 'sort field' fields
+    _message 'prefix with + (ascending) or - (descending)'
+  fi
+}
+
+(( $+functions[_ttdl_group_fields] )) ||
+_ttdl_group_fields() {
+  local -a fields=(
+    'prj:group by project'
+    'ctx:group by context'
+    'hash:group by hashtag'
+  )
+  _describe -t group-fields 'group field' fields
+}
+
+(( $+functions[_ttdl_clean_subject] )) ||
+_ttdl_clean_subject() {
+  local -a modes=(
+    'none:show full subject'
+    'tags:remove duplicate tags from subject'
+    'all:remove all duplicated info'
+  )
+  _describe -t clean-modes 'clean mode' modes
+}
+
+# Comma-separated list of columns to always hide
+(( $+functions[_ttdl_hide_cols] )) ||
+_ttdl_hide_cols() {
+  _values -s , 'column' \
+    'pri[priority]' \
+    'created[creation date]' \
+    'finished[completion date]' \
+    'due[due date]' \
+    'thr[threshold date]' \
+    'spent[time spent]' \
+    'prj[project]' \
+    'ctx[context]'
+}
+
+(( $+functions[_ttdl_calendar_range] )) ||
+_ttdl_calendar_range() {
+  local -a ranges=(
+    '1d:1 day'
+    '1w:1 week'
+    '2w:2 weeks'
+    '1m:1 month'
+    '3m:3 months'
+    '1y:1 year'
+  )
+  _describe -t calendar-range 'calendar range' ranges
+}
+
+# Replacement pattern helpers for --repl-* options
+(( $+functions[_ttdl_repl_proj] )) ||
+_ttdl_repl_proj() {
+  local current="$words[CURRENT]"
+  if [[ "$current" == *+* ]]; then
+    # After separator: complete new project name
+    local old="${current%%+*}"
+    local -a projects
+    projects=(${(f)"$(_call_program listprojects ttdl listprojects 2>/dev/null)"})
+    [[ -n "$projects" ]] && compadd -S ' ' -P "${old}+" -- "${projects[@]}"
+  else
+    # Before separator: complete existing project, add + suffix
+    local -a projects
+    projects=(${(f)"$(_call_program listprojects ttdl listprojects 2>/dev/null)"})
+    [[ -n "$projects" ]] && compadd -S '+' -- "${projects[@]}"
+  fi
+}
+
+(( $+functions[_ttdl_repl_ctx] )) ||
+_ttdl_repl_ctx() {
+  local current="$words[CURRENT]"
+  if [[ "$current" == *@* ]]; then
+    # After separator: complete new context name
+    local old="${current%%@*}"
+    local -a contexts
+    contexts=(${(f)"$(_call_program listcontexts ttdl listcontexts 2>/dev/null)"})
+    [[ -n "$contexts" ]] && compadd -S ' ' -P "${old}@" -- "${contexts[@]}"
+  else
+    # Before separator: complete existing context, add @ suffix
+    local -a contexts
+    contexts=(${(f)"$(_call_program listcontexts ttdl listcontexts 2>/dev/null)"})
+    [[ -n "$contexts" ]] && compadd -S '@' -- "${contexts[@]}"
+  fi
+}
+
+(( $+functions[_ttdl_repl_hashtag] )) ||
+_ttdl_repl_hashtag() {
+  local current="$words[CURRENT]"
+  if [[ "$current" == *=* ]]; then
+    # After separator: complete new hashtag name
+    local old="${current%%=*}"
+    local -a hashtags
+    hashtags=(${(f)"$(_call_program listhashtags ttdl listhashtags 2>/dev/null)"})
+    [[ -n "$hashtags" ]] && compadd -Q -S ' ' -P "${old}=" -- "${hashtags[@]}"
+  else
+    # Before separator: complete existing hashtag, add = suffix
+    local -a hashtags
+    hashtags=(${(f)"$(_call_program listhashtags ttdl listhashtags 2>/dev/null)"})
+    [[ -n "$hashtags" ]] && compadd -Q -S '=' -- "${hashtags[@]}"
+  fi
+}
+
+(( $+functions[_ttdl_duration] )) ||
+_ttdl_duration() {
+  local current="$words[CURRENT]"
+
+  # Check if user is typing a number
+  if [[ "$current" =~ ^[0-9]+$ ]]; then
+    local -a units=(
+      'h:hours'
+      'd:days'
+      'w:weeks'
+      'm:months'
+    )
+    _describe -t units 'unit' units -P "$current" -S ' '
+    return
+  fi
+
+  local -a durations=(
+    '1h:1 hour'
+    '2h:2 hours'
+    '1d:1 day'
+    '2d:2 days'
+    '1w:1 week'
+    '2w:2 weeks'
+    '1m:1 month'
+  )
+  _describe -t durations 'duration' durations
+}
+
+# ------------------------------------------------------------------------------
+# Subject completion with inline syntax
+# ------------------------------------------------------------------------------
+
+# Subjects are typically quoted: t a '(B) foo @work due:today'
+# Complete inline tags only when inside the quoted string
+# Uses compset -q to handle completion inside quotes
+
+(( $+functions[_ttdl_subject] )) ||
+_ttdl_subject() {
+  local current="$words[CURRENT]"
+
+  # Handle quoted strings: t a '(A) Foo @
+  # Strip opening quote, find last token, complete based on that token
+  local stripped="$current"
+
+  if [[ "$current" == \'* ]]; then
+    stripped="${current#\'}"
+  elif [[ "$current" == \"* ]]; then
+    stripped="${current#\"}"
+  fi
+
+  # Get the last token (after last space)
+  local last_token="${stripped##* }"
+  [[ -z "$stripped" || "$stripped" == *[[:space:]] ]] && last_token=""
+
+  # Use compset -P with '*pattern' to move everything up to and including
+  # the pattern to IPREFIX, leaving only the part after the pattern in PREFIX.
+  case "$last_token" in
+    due:*)
+      compset -P '*due:'
+      _ttdl_dates_inline_values
+      ;;
+    t:*)
+      compset -P '*t:'
+      _ttdl_dates_inline_values
+      ;;
+    pri:*)
+      compset -P '*pri:'
+      local -a priorities=('A' 'B' 'C' 'D' 'E' 'F' 'G' 'H' 'I' 'J' 'K' 'L' 'M' 'N' 'O' 'P' 'Q' 'R' 'S' 'T' 'U' 'V' 'W' 'X' 'Y' 'Z')
+      compadd -S ' ' -- "${priorities[@]}"
+      ;;
+    rec:*)
+      compset -P '*rec:'
+      local val="$PREFIX"
+      if [[ "$val" =~ ^[+]?[0-9]+$ ]]; then
+        compset -P '[+]#[0-9]##'
+        local -a units=('d' 'w' 'm' 'y' 'b')
+        compadd -S ' ' -- "${units[@]}"
+      else
+        local -a recurrence=('1d' '1w' '1m' '1y' '+1d' '+1w' '+1m')
+        compadd -S ' ' -- "${recurrence[@]}"
+      fi
+      ;;
+    +*)
+      compset -P '*+'
+      local -a projects
+      projects=(${(f)"$(_call_program listprojects ttdl listprojects 2>/dev/null)"})
+      [[ ${#projects[@]} -gt 0 ]] && compadd -S ' ' -- "${projects[@]}" || _message 'no projects found'
+      ;;
+    @*)
+      compset -P '*@'
+      local -a contexts
+      contexts=(${(f)"$(_call_program listcontexts ttdl listcontexts 2>/dev/null)"})
+      [[ ${#contexts[@]} -gt 0 ]] && compadd -S ' ' -- "${contexts[@]}" || _message 'no contexts found'
+      ;;
+    \#*)
+      compset -P '*#'
+      local -a hashtags
+      hashtags=(${(f)"$(_call_program listhashtags ttdl listhashtags 2>/dev/null)"})
+      [[ ${#hashtags[@]} -gt 0 ]] && compadd -Q -S ' ' -- "${hashtags[@]}" || _message 'no hashtags found'
+      ;;
+    ""|d*|t*|p*|r*)
+      compset -P '*'
+      local -a keywords=('due:' 't:' 'pri:' 'rec:')
+      compadd -S '' -- "${keywords[@]}"
+      compadd -S '' -- '+' '@'
+      compadd -Q -S '' -- '#'
+      ;;
+    *)
+      _message 'subject text, or @context +project #hashtag due: t: pri: rec:'
+      ;;
+  esac
+}
+
+# Helper for inline date completion in subject (no prefix handling)
+(( $+functions[_ttdl_dates_inline_values] )) ||
+_ttdl_dates_inline_values() {
+  local current="$PREFIX"
+
+  # Check if typing a number for relative date
+  if [[ "$current" =~ ^[0-9]+$ ]]; then
+    compset -P '[0-9]##'
+    local -a units=('d' 'w' 'm' 'y')
+    compadd -S ' ' -- "${units[@]}"
+    return
+  fi
+
+  local -a dates=('today' 'tomorrow' '1d' '1w' '2w' '1m' 'none')
+  local -a weekdays=('monday' 'tuesday' 'wednesday' 'thursday' 'friday' 'saturday' 'sunday')
+
+  compadd -S ' ' -- "${dates[@]}"
+  compadd -S ' ' -- "${weekdays[@]}"
+}
+
+# Helper for subject keywords
+(( $+functions[_ttdl_subject_keywords] )) ||
+_ttdl_subject_keywords() {
+  local prefix="${1:-}"
+  local -a keywords=('due:' 't:' 'pri:' 'rec:')
+
+  compadd -S '' -P "$prefix" -- "${keywords[@]}"
+  compadd -S '' -P "$prefix" -- '+' '@'
+  # -Q: don't escape the # character
+  compadd -Q -S '' -P "$prefix" -- '#'
+}
+
+# Helper for inline date completion in subject
+(( $+functions[_ttdl_dates_inline] )) ||
+_ttdl_dates_inline() {
+  local prefix="$1"
+  local current="$2"
+
+  # Check if typing a number
+  if [[ "$current" =~ ^[0-9]+$ ]]; then
+    local -a units=('d' 'w' 'm' 'y')
+    compadd -S ' ' -P "$prefix$current" -- "${units[@]}"
+    return
+  fi
+
+  local -a dates=('today' 'tomorrow' '1d' '1w' '2w' '1m')
+  local -a weekdays=('monday' 'tuesday' 'wednesday' 'thursday' 'friday' 'saturday' 'sunday')
+  local -a months=('january' 'february' 'march' 'april' 'may' 'june' 'july' 'august' 'september' 'october' 'november' 'december')
+
+  compadd -S ' ' -P "$prefix" -- "${dates[@]}"
+  compadd -S ' ' -P "$prefix" -- "${weekdays[@]}"
+  compadd -S ' ' -P "$prefix" -- "${months[@]}"
+}
+
+# ------------------------------------------------------------------------------
+# Commands (grouped by type)
+# ------------------------------------------------------------------------------
+
+(( $+functions[_ttdl_commands] )) ||
+_ttdl_commands() {
+  local -a list_cmds=(
+    'list:List todos'
+    'l:List todos (alias)'
+  )
+  local -a modify_cmds=(
+    'add:Add a new todo'
+    'a:Add a new todo (alias)'
+    'edit:Modify selected todos'
+    'e:Modify todos (alias)'
+    'append:Add text to the end of todos'
+    'prepend:Insert text at the beginning of todos'
+    'postpone:Push due date forward'
+  )
+  local -a status_cmds=(
+    'done:Mark todos as completed'
+    'd:Mark completed (alias)'
+    'undone:Mark completed todos as pending'
+    'start:Activate timer for a todo'
+    'stop:Stop timer and update time spent'
+  )
+  local -a delete_cmds=(
+    'remove:Delete selected todos'
+    'rm:Delete todos (alias)'
+    'clean:Archive completed todos to done.txt'
+    'archive:Archive completed (alias)'
+  )
+  local -a info_cmds=(
+    'stats:Show todo list statistics'
+    'listprojects:List all projects'
+    'lp:List projects (alias)'
+    'listcontexts:List all contexts'
+    'lc:List contexts (alias)'
+    'listhashtags:List all hashtags'
+  )
+
+  _describe -t list-commands 'list' list_cmds
+  _describe -t modify-commands 'modify' modify_cmds
+  _describe -t status-commands 'status' status_cmds
+  _describe -t delete-commands 'delete' delete_cmds
+  _describe -t info-commands 'info' info_cmds
+}
+
+# ------------------------------------------------------------------------------
+# Main completion function
+# ------------------------------------------------------------------------------
+
+_ttdl() {
+  local curcontext="$curcontext" state state_descr line ret=1
+  typeset -A opt_args
+
+  # Global options
+  local -a global_opts=(
+    '(- :)'{-h,--help}'[display help message]'
+    '(- :)'{-v,--version}'[display version information]'
+    '(-c --config)'{-c,--config}'[configuration file path]:config file:_files'
+    '--todo-file[specify todo.txt file]:todo file:_files'
+    '--done-file[specify done.txt file]:done file:_files'
+    '--local[use todo.txt from current directory]'
+    '--init[create default config in home directory]'
+    '--init-local[create default config in current directory]'
+    '--no-colors[disable colored output]'
+    '--strict[require explicit commands]'
+    '--dry-run[preview changes without saving]'
+  )
+
+  # Filter options (shared by many commands)
+  local -a filter_opts=(
+    '(-a --all -A --only-completed)'{-a,--all}'[include completed todos]'
+    '(-A --only-completed -a --all)'{-A,--only-completed}'[only completed todos]'
+    '(-e --regex)'{-e,--regex}'[use regex for search]'
+    '--done[use done.txt archive file]'
+    '--hidden[include hidden tasks]'
+    '--due[by due date]:date range:_ttdl_dates'
+    '--threshold[by threshold date]:date range:_ttdl_dates'
+    '--created[by creation date]:date range:_ttdl_dates'
+    '--completed[by completion date]:date range:_ttdl_dates'
+    '--pri[by priority]:priority:_ttdl_priorities'
+    '--rec[by recurrence]:recurrence:_ttdl_rec_filter'
+    '*--project[by project]:project:_ttdl_projects'
+    '*--context[by context]:context:_ttdl_contexts'
+    '*--tag[by tag]:tag:_ttdl_tag_filter'
+    '*--hashtag[by hashtag]:hashtag:_ttdl_hashtags'
+    '--filter[complex filter expression]:expression:_ttdl_filter_expr'
+  )
+
+  # Display options
+  local -a display_opts=(
+    '(-V --verbose --short)'{-V,--verbose}'[extra information]'
+    '(--short -V --verbose)--short[only IDs, priorities, and subjects]'
+    '--compact[relative dates in compact mode]'
+    '--fields[specify columns]:fields:_ttdl_fields_list'
+    '--auto-hide-cols[hide empty columns]'
+    '--auto-show-cols[show all existing tags as columns]'
+    '--always-hide-cols[tags to never show as columns]:columns:_ttdl_hide_cols'
+    '--clean-subject[remove duplicated info from subject]:mode:_ttdl_clean_subject'
+    '--human[dates in relative format]'
+    '(--syntax --no-syntax)--no-syntax[disable keyword highlights]'
+    '(--no-syntax --syntax)--syntax[enable keyword highlights]'
+    '--width[terminal width for wrapping]:width'
+    '--wrap[wrap long subjects]'
+    '--sort[sort by fields]:fields:_ttdl_sort_fields'
+    '--sort-rev[reverse sort order]'
+    '--group[group results by field]:field:_ttdl_group_fields'
+    '--calendar[calendar view]:range:_ttdl_calendar_range'
+  )
+
+  # Edit options (most can be repeated)
+  local -a edit_opts=(
+    '--set-pri[set priority]:priority:_ttdl_set_priority'
+    '--set-due[set due date]:date:_ttdl_dates'
+    '--set-threshold[set threshold date]:date:_ttdl_dates'
+    '--set-rec[set recurrence]:recurrence:_ttdl_recurrence'
+    '*--set-proj[add project]:project:_ttdl_projects'
+    '*--set-ctx[add context]:context:_ttdl_contexts'
+    '*--set-tag[add tag]:tag:_ttdl_tag_value'
+    '*--set-hashtag[add hashtag]:hashtag:_ttdl_hashtags'
+    '*--del-proj[remove project]:project:_ttdl_projects'
+    '*--del-ctx[remove context]:context:_ttdl_contexts'
+    '*--del-tag[remove tag]:tag:_ttdl_tag_filter'
+    '*--del-hashtag[remove hashtag]:hashtag:_ttdl_hashtags'
+    '*--repl-proj[replace project (old+new)]:replacement:_ttdl_repl_proj'
+    '*--repl-ctx[replace context (old@new)]:replacement:_ttdl_repl_ctx'
+    '*--repl-hashtag[replace hashtag (old=new)]:replacement:_ttdl_repl_hashtag'
+  )
+
+  _arguments -C -s \
+    "${global_opts[@]}" \
+    '(-): :->command' \
+    '(-)*:: :->args' && ret=0
+
+  case $state in
+    (command)
+      _ttdl_commands && ret=0
+      ;;
+    (args)
+      curcontext="${curcontext%:*:*}:ttdl-$words[1]:"
+      case $words[1] in
+        (list|l)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            "${display_opts[@]}" \
+            '*:search term or ID:_ttdl_search' && ret=0
+          ;;
+        (add|a)
+          _arguments -s \
+            '(-p --priority)'{-p,--priority}'[set priority]:priority:_ttdl_set_priority' \
+            '--due[set due date]:date:_ttdl_dates' \
+            '--threshold[set threshold date]:date:_ttdl_dates' \
+            '--rec[set recurrence]:recurrence:_ttdl_recurrence' \
+            '*:todo subject:_ttdl_subject' && ret=0
+          ;;
+        (done|d)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '*:todo ID:_ttdl_todo_ids' && ret=0
+          ;;
+        (undone)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '--done[operate on done.txt]' \
+            '*:todo ID:_ttdl_todo_ids' && ret=0
+          ;;
+        (remove|rm)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '--wipe[permanently delete instead of archive]' \
+            '*:todo ID:_ttdl_todo_ids' && ret=0
+          ;;
+        (edit|e)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            "${edit_opts[@]}" \
+            '(-i --interactive)'{-i,--interactive}'[edit in external editor]' \
+            '(-k --keep-tags)'{-k,--keep-tags}'[preserve existing tags when replacing]' \
+            '*:todo ID:_ttdl_todo_ids' && ret=0
+          ;;
+        (append)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '1:todo ID:_ttdl_todo_ids' \
+            '*:text to append:_ttdl_subject' && ret=0
+          ;;
+        (prepend)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '1:todo ID:_ttdl_todo_ids' \
+            '*:text to prepend:_ttdl_subject' && ret=0
+          ;;
+        (postpone)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '--update-threshold[also update threshold date]' \
+            '1:todo ID:_ttdl_todo_ids' \
+            '2:duration:_ttdl_duration' && ret=0
+          ;;
+        (start)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '*:todo ID:_ttdl_todo_ids' && ret=0
+          ;;
+        (stop)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '*:todo ID:_ttdl_todo_ids' && ret=0
+          ;;
+        (clean|archive)
+          _arguments -s \
+            '--wipe[permanently delete instead of archive]' \
+            '--keep-empty[preserve empty lines]' && ret=0
+          ;;
+        (stats)
+          _arguments -s \
+            '--short[show only general statistics]' \
+            "${filter_opts[@]}" && ret=0
+          ;;
+        (listprojects|lp)
+          _arguments -s \
+            "${filter_opts[@]}" && ret=0
+          ;;
+        (listcontexts|lc)
+          _arguments -s \
+            "${filter_opts[@]}" && ret=0
+          ;;
+        (listhashtags)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            '*:search term:_ttdl_hashtags' && ret=0
+          ;;
+        (*)
+          _message "unknown command: $words[1]"
+          ;;
+      esac
+      ;;
+  esac
+
+  return ret
+}
+
+_ttdl "$@"
+
+# Local Variables:
+# mode: Shell-Script
+# sh-indentation: 2
+# indent-tabs-mode: nil
+# sh-basic-offset: 2
+# End:
+# vim: ft=zsh sw=2 ts=2 et
