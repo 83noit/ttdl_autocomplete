@@ -434,6 +434,7 @@ _ttdl_fields_list() {
     'finished[completion date]' \
     'due[due date]' \
     'thr[threshold date]' \
+    'until[date until which a recurrent task is active]' \
     'spent[time spent]' \
     'uid[unique ID]' \
     'parent[parent task]' \
@@ -781,6 +782,8 @@ _ttdl_commands() {
     'listcontexts:List all contexts'
     'lc:List contexts (alias)'
     'listhashtags:List all hashtags'
+    'agenda:Show tasks on a time line for a day'
+    'ag:Show agenda (alias)'
   )
 
   _describe -t list-commands 'list' list_cmds
@@ -842,10 +845,12 @@ _ttdl() {
     '--auto-hide-cols[hide empty columns]'
     '--auto-show-cols[show all existing tags as columns]'
     '--always-hide-cols[tags to never show as columns]:columns:_ttdl_hide_cols'
+    '--hide-fields[hide fields from subject and columns]:fields'
     '--clean-subject[remove duplicated info from subject]:mode:_ttdl_clean_subject'
     '--human[dates in relative format]'
     '(--syntax --no-syntax)--no-syntax[disable keyword highlights]'
     '(--no-syntax --syntax)--syntax[enable keyword highlights]'
+    '--markdown[render Markdown formatting in task subjects]'
     '--width[terminal width for wrapping]:width'
     '--wrap[wrap long subjects]'
     '--sort[sort by fields]:fields:_ttdl_sort_fields'
@@ -975,6 +980,16 @@ _ttdl() {
           _arguments -s \
             "${filter_opts[@]}" \
             '*:search term:_ttdl_hashtags' && ret=0
+          ;;
+        (agenda|ag)
+          _arguments -s \
+            "${filter_opts[@]}" \
+            "${display_opts[@]}" \
+            '--hide-all-day[hide the All day section]' \
+            '--no-hide-all-day[show the All day section (overrides config)]' \
+            '--slot[time slot length (e.g. 30, 1h)]:slot' \
+            '--time[time line range (e.g. 800-2000, 1200-1400)]:time range' \
+            '--on[date or field to match tasks (e.g. today, due, "due=2025-10-14")]:date or field:_ttdl_dates' && ret=0
           ;;
         (*)
           _message "unknown command: $words[1]"
