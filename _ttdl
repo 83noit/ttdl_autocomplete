@@ -440,7 +440,9 @@ _ttdl_fields_list() {
     'parent[parent task]' \
     'prj[project]' \
     'ctx[context]' \
-    'subject[task subject]'
+    'subject[task subject]' \
+    'src[source task list name]' \
+    'src_id[source task list ordinal number]'
 }
 
 (( $+functions[_ttdl_sort_fields] )) ||
@@ -467,6 +469,8 @@ _ttdl_sort_fields() {
     'subject:task subject'
     'project:project name'
     'context:context name'
+    'src:source task list name'
+    'src_id:source task list ordinal number'
   )
 
   if [[ -n "$prefix" ]]; then
@@ -483,6 +487,8 @@ _ttdl_group_fields() {
     'prj:group by project'
     'ctx:group by context'
     'hash:group by hashtag'
+    'src:group by source task list name'
+    'src_id:group by source task list ordinal number'
   )
   _describe -t group-fields 'group field' fields
 }
@@ -814,6 +820,8 @@ _ttdl() {
     '--no-colors[disable colored output]'
     '--strict[require explicit commands]'
     '--dry-run[preview changes without saving]'
+    '--src[select source task list (name or 1-based index)]:source'
+    '--list-sources[show info about all task lists]'
   )
 
   # Filter options (shared by many commands)
@@ -864,6 +872,7 @@ _ttdl() {
     '--set-pri[set priority]:priority:_ttdl_set_priority'
     '--set-due[set due date]:date:_ttdl_dates'
     '--set-threshold[set threshold date]:date:_ttdl_dates'
+    '--set-time[set time tag (HH:MM, HH:MM-HH:MM, or none)]:time'
     '--set-rec[set recurrence]:recurrence:_ttdl_recurrence'
     '*--set-proj[add project]:project:_ttdl_projects'
     '*--set-ctx[add context]:context:_ttdl_contexts'
@@ -907,6 +916,7 @@ _ttdl() {
         (done|d)
           _arguments -s \
             "${filter_opts[@]}" \
+            '(-r --resolution)'{-r,--resolution}'[append resolution text to completed tasks]:resolution' \
             '*:todo ID:_ttdl_todo_ids' && ret=0
           ;;
         (undone)
